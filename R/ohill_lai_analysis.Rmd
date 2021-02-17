@@ -1,0 +1,347 @@
+---
+title: "OHill-Meadow Creek Leaf Area"
+author: "Jeff Atkins"
+date: "2/10/2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# dependancies
+require(raster)
+require(lidR)
+require(sf)
+require(rgdal)
+require(viridis)
+require(ggplot2)
+require(readr)
+require(tidyverse)
+require(leafR)
+require(canopyLazR)
+require(vegan)
+require(reldist)
+```
+
+## OVERVIEW
+
+This script builds rasters of leaf area for western Charlottesville, specifically to include Observatory Hill (OHill) using three different methods:  1) canopyLazR (Kamoske et al. 2019), 2) leafR (Almeida et al 2019???) and 3) eventually the LAD function in lidR, but this one is too intensive as of now. 
+
+Section One we import the files:
+
+```{r import files}
+
+# establish directory of files 
+las.dir <- "./ohill/"
+las.files <- list.files(path = las.dir, pattern = ".la", full.names = FALSE)
+
+```
+
+### `canopyLazR`
+
+The `canopyLazR` packaage uses a MacArthur-Horn transformation to estimate leaf area density (LAD) for each canopy layer (determined by the user in the `las.to.array` function `z.resolution` here we use 3.28084 because our source .las data are in feet and we want meters). `canopyLazR` inputs .las files directly. 
+
+```{r canopyLazR, eval = FALSE}
+# empty raster stack to fill
+lai.list <- vector("list", length(las.files))
+
+# for loop
+for(i in 1:length(las.files)){
+  
+# Convert .laz or .las file into a voxelized lidar array    NOTE:  our OHill data set are in feet
+laz.data <- laz.to.array(laz.file.path = file.path(las.dir, las.files[i]), 
+                         voxel.resolution = 32.8084, 
+                         z.resolution = 3.28084,
+                         use.classified.returns = TRUE)
+
+# Level the voxelized array to mimic a canopy height model
+level.canopy <- canopy.height.levelr(lidar.array = laz.data)
+
+# Estimate LAD for each voxel in leveled array
+lad.estimates <- machorn.lad(leveld.lidar.array = level.canopy, 
+                           voxel.height = 3.28084, 
+                           beer.lambert.constant = NULL)
+
+# Convert the LAD array into a single raster stack
+lad.raster <- lad.array.to.raster.stack(lad.array = lad.estimates, 
+                                      laz.array = laz.data, 
+                                      epsg.code = 2284)
+
+# Create a single LAI raster from the LAD raster list
+lai.list[[i]] <- raster::calc(lad.raster, fun = sum, na.rm = TRUE)
+
+}
+
+# return raster mosaic
+
+# mosaicks our list of rasters and writes them to disk
+lai.list$fun <- mean
+ohill.lai <- do.call(mosaic, lai.list)
+
+writeRaster(ohill.lai, "./data/ohill_lai_canopyLazR.tif", format="GTiff")
+```
+
+### `leafR`
+
+The `leafR` package (Almeida et al. 2019???) creates a similar raster of LAI values, but requires as input of normalized .las file.
+
+**currently this needs the `writeLAS` step in the for loop fixed to make file naming reflexive--it just overwrites right now. 
+
+```{r leafR, eval = FALSE}
+
+# establish directory of files 
+las.dir <- "./ohill/"
+las.files <- list.files(path = las.dir, pattern = ".laz", full.names = TRUE)
+
+lai.list2 <- vector("list", length(las.files))
+
+for(i in 1:length(las.files)){
+  
+# import las file
+las <- readLAS(las.files[i])
+
+las.norm <- normalize_height(las, algorithm = tin(), na.rm = TRUE)
+
+# Get the example laz file
+writeLAS(las.norm, "./data/norm_las_leafR.las")
+
+# then remove the las.norm
+rm(las.norm)
+
+# import
+normlas.file = "./data/norm_las_leafR.las"
+
+# Calculate LAD from voxelization
+# use thicker grain size to avoid voxels
+# without returns
+VOXELS_LAD = lad.voxels(normlas.file,
+                        grain.size = 32.8084, k=1)
+
+#Map using absolute values
+lai.list2[[i]] = lai.raster(VOXELS_LAD)
+
+}
+
+
+#####
+lai.list2$fun <- mean
+lai.list2$tolerance <- 0.5
+ohill.lai2 <- do.call(mosaic, lai.list2)
+
+# writes the raster stack to file
+writeRaster(ohill.lai2, "./data/ohill_lai_leafR.tif", format="GTiff")
+
+# may need to do this to mosaic it though, because leafR introduces some weird issues that need to be adjusted using the tolerance in mosaic.
+# ohill.lai2 <- raster::mosaic(lai.list2[[1]], lai.list2[[2]], lai.list2[[3]], lai.list2[[4]], fun = mean, tolerance = 0.5)
+# 
+# x11()
+# plot(ohill.lai2)
+```
+
+### leafR-canopylazR comparison
+
+```{r comparison}
+# here is the correct crs if an issue
+ohill.crs <- "+proj=lcc +lat_0=36.3333333333333 +lon_0=-78.5 +lat_1=37.9666666666667
++lat_2=36.7666666666667 +x_0=3500000.0001016 +y_0=999999.9998984 +datum=NAD83
++units=us-ft +no_defs"
+
+###############################
+# extracting plot values
+ohill.lazr <- raster("./data/ohill_lai_canopyLazR.tif")
+ohill.leafr <-raster( "./data/ohill_lai_leafR.tif")
+
+# read in shape files
+plots <- st_read("./data/OHill_Sample_Site_Atlas/aspect_points.shp")
+
+# we have a bunch of duplicated ones for some dang reason
+points <- plots[!duplicated(data.frame(plots$Samp_ID)), ]
+points <- data.frame(points)
+pts <- points[, c("X", "Y", "Samp_ID")]
+
+names(pts)[1] <- "easting"
+names(pts)[2] <- "northing"
+
+# adjusting CRS firs
+crs(ohill.lazr)
+crs(ohill.leafr) <- crs(ohill.lazr) # this needs to be adjusted
+
+# this converts the points
+pts <- SpatialPointsDataFrame(pts[, 1:2], proj4string = ohill.lazr@crs, pts)
+
+
+# x11()
+# ggplot()+
+#   geom_sf(data = pts, size = 3, color = "black")
+#####
+
+# 
+# 
+# x11()
+# ggplot()+
+#   geom_raster(data = pts, aes(x = x, y = y, fill = layer))+
+#   scale_fill_viridis("OHill\nLAI", direction = -1)+
+#   geom_sf(data = pts, size = 1.5, color = "black")+
+#   xlab("")+
+#   ylab("")
+
+
+#####
+# extracting using a buffer of 1.5
+plot.lai.lazR <- raster::extract(ohill.lazr,
+                            pts, 
+                            buffer = 2,
+                            fun = mean,
+                            na.rm = TRUE,
+                            df = TRUE)
+
+plot.lai.leafR <- raster::extract(ohill.leafr,
+                            pts, 
+                            buffer = 2,
+                            fun = mean,
+                            na.rm = TRUE,
+                            df = TRUE)
+
+#### Use the plot ID
+plot.lai <- cbind(plot.lai.lazR, plot.lai.leafR)
+plot.lai$plot_id <- pts$Samp_ID
+
+names(plot.lai)[2] <- "lai_lazR"
+names(plot.lai)[4] <- "lai_leafR"
+
+plot.lai <- plot.lai[, c("plot_id", "lai_lazR", "lai_leafR")]
+
+# fix the plot_id columns
+ind = which(nchar(plot.lai$plot_id) == 4)
+plot.lai$plot_id[ind] = paste0(substr(plot.lai$plot_id[ind], 1, 3), "0", substr(plot.lai$plot_id[ind], 4, 6))
+
+
+#write.csv(plot.lai, "ohill_lai_10m_res.csv")
+
+
+ggplot(plot.lai, aes(x = lai_lazR, y = lai_leafR))+
+  geom_point(size = 2, shape = 21, color = "black", fill = "dodger blue")+
+  theme_classic()+
+  xlab("")+
+  ylab("")+
+  xlim(0, 3)+
+  ylim(0,3)+
+  ylab("LAI - canopyLazR algorithm")+
+  xlab("LAI - leafR algorithm")+
+  geom_abline(slope = 1)
+
+```
+
+```{r metrics}
+###### play with grid metrics
+# dtm dir
+metrics.dir <- "./data/grid_metrics/"
+
+# ohill shape file boundaries
+ohill.shp <- st_read("./data/OHill_Sample_Site_Atlas/export_output.shp")
+#metrics.files <- list.files(path = metrics.dir, pattern = ".csv", full.names = TRUE)
+
+metrics.files <- list.files(path = metrics.dir, pattern = "*norm.tif", full.names = TRUE)
+
+
+#grid <- grid.metrics[, c ("x", "y", "zentropy")]
+r1 <- stack(metrics.files[1])
+r2 <- stack(metrics.files[2])
+r3 <- stack(metrics.files[3])
+r4 <- stack(metrics.files[4])
+
+grid.list <- list(r1, r2, r3, r4)
+
+grid.list$fun <- mean
+ohill.grid <- do.call(mosaic, grid.list)
+
+# add the stack names
+stack.names = c("IQR", "VCI", "Entropy", "FHD", "VDR", "Top Rugosity", "MOCH", "Skewness", "FirstBelow1m", "FirstBelow2m", "FirstBelow5m", "Below1m", "Below2m", "Below5m", "p10", "p25", "p75", "p90", "p95", "SDIntensity", "MeanIntensity")
+
+# change names of layers in stack
+names(ohill.grid) <- stack.names
+# 
+# 
+# 
+# dfr <- rasterFromXYZ(df, crs = lai.ohill@crs)  #Convert first two columns as lon-lat and third as value                
+# 
+# plot(ohill.grid[[2]])
+
+plot.grid<- raster::extract(ohill.grid,
+                            pts, 
+                            buffer = 1.5,
+                            fun = mean,
+                            na.rm = TRUE,
+                            df = TRUE)
+
+#### Use the plot ID
+plot.grid$plot_id <- pts$Samp_ID
+
+# fix the plot_id columns
+ind = which(nchar(plot.grid$plot_id) == 4)
+plot.grid$plot_id[ind] = paste0(substr(plot.grid$plot_id[ind], 1, 3), "0", substr(plot.grid$plot_id[ind], 4, 6))
+
+```
+
+## Forest Inventory 
+
+This section brings in forest inventory data from the Shugart OHill data set established in 2012 by Jennifer Holms, Jeff Atkins and the Forest Sampling 4XX/5XX class which was then continued by Adrianna Foster and Atticus Stovall and subsequent classes. No idea whjere the current status of this data set. 
+
+```{r forest inventory}
+
+# inventory
+inv <- read.csv("ohill_forest_inventory.csv")
+
+# change some stuff
+# note, each plots is 1/8ha or 16 m radius
+inv$plot_id <- as.factor(inv$plot_id)
+
+# Making some inventory stuff
+inv %>%
+  dplyr::group_by(plot_id) %>%
+  dplyr::summarize(dbh_sd = sd(dbh_cm, na.rm = TRUE)) %>%
+  data.frame() -> sdDBH
+
+# stocking
+inv %>%
+  dplyr::group_by(plot_id) %>%
+  dplyr::summarize(stocking_m_ha = (sum(ba, na.rm = TRUE) * 0.0001 * 8)) %>%
+  data.frame() -> stocking
+
+# make dbh _class
+inv$dbh_class <- round(inv$dbh_cm/5) * 5
+
+dbh.classes <- data.frame(table(inv$dbh_class, inv$plot_id))
+a <- spread(dbh.classes, Var1, Freq)
+
+b <- diversity(a[, c(2:12)], index = "simpson")
+
+# dbh diversity
+dbh.div <- data.frame(a$Var2)
+dbh.div$dbh_shan <- b
+
+colnames(dbh.div)[1] <- "plot_id"
+
+giniplots <- aggregate(dbh_cm ~ plot_id,
+                       data = inv,
+                       FUN = "gini")
+
+names(giniplots) <- c("plot_id", "gini")
+
+# bring em together
+df <- merge(sdDBH, stocking)
+df <- merge(df, dbh.div)
+df <- merge(df, giniplots)
+
+# merge with lai
+df <- merge(df, plot.lai)
+
+# fix plot.grid for this
+plot.grid.short <- plot.grid[, c(2, 6:23)]
+df <- merge(df, plot.grid.short)
+df.CORR <- na.omit(df)
+M <- cor(df.CORR[, c(2:25)])
+
+corrplot::corrplot(M, method = "circle", type = "upper")
+```
